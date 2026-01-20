@@ -20,6 +20,7 @@ package objects
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 
 	"gotest.tools/v3/assert"
@@ -31,6 +32,7 @@ import (
 	schedEvt "github.com/apache/yunikorn-core/pkg/scheduler/objects/events"
 	"github.com/apache/yunikorn-scheduler-interface/lib/go/common"
 	"github.com/apache/yunikorn-scheduler-interface/lib/go/si"
+	"github.com/google/go-cmp/cmp"
 )
 
 const testNode = "testnode"
@@ -757,7 +759,8 @@ func TestUpdateResources(t *testing.T) {
 	}
 
 	// reset and check with allocated
-	total = resources.NewResourceFromMap(map[string]resources.Quantity{"first": 10, "second": 10})
+	total = resources.NewResourceFromMap(map[string]resources.Quantity{"first": 10, "second": 10, "unknown": 0})
+	prunedTotal := resources.NewResourceFromMap(map[string]resources.Quantity{"first": 10, "second": 10})
 	node = newNodeRes("node-123", total)
 	if !resources.IsZero(node.occupiedResource) || !resources.IsZero(node.allocatedResource) || !resources.Equals(total, node.GetCapacity()) {
 		t.Fatalf("node not initialised correctly")
@@ -767,6 +770,9 @@ func TestUpdateResources(t *testing.T) {
 	available = resources.Sub(total, alloc)
 	// fake the update to recalculate available
 	node.refreshAvailableResource()
+	assert.Assert(t, resources.Equals(node.GetCapacity(), prunedTotal), "total resource should be equal to the pruned total")
+	assert.Assert(t, resources.Equals(available, node.GetAvailableResource()), "available resources should have been updated to: %s, got %s", available, node.GetAvailableResource())
+
 	if !resources.Equals(available, node.GetAvailableResource()) {
 		t.Errorf("available resources should have been updated to: %s, got %s", available, node.GetAvailableResource())
 	}
@@ -1000,4 +1006,91 @@ func TestUpdateForeignAllocation(t *testing.T) {
 	prev = node.UpdateForeignAllocation(alloc2)
 	assert.Assert(t, prev == nil, "unexpected previous allocation returned")
 	assert.Assert(t, node.GetAllocation(foreignAlloc2) == alloc2, "foreign allocation not found")
+}
+
+func TestTotalResourcePrune(t *testing.T) {
+	total := resources.NewResourceFromMap(map[string]resources.Quantity{"cpu": 10, "memory": 10, "gpu": 0})
+	prunedTotal := resources.NewResourceFromMap(map[string]resources.Quantity{"cpu": 10, "memory": 10})
+	t.Run("NewNode prunes during initialization", func(t *testing.T) {
+		proto := newProto("node-with-zero-gpu", total, map[string]string{
+			"ready": "true",
+		})
+		node := NewNode(proto)
+		assert.Assert(t, !resources.DeepEquals(node.totalResource, total), "total resource should not be equal to the input")
+		assert.Assert(t, resources.DeepEquals(node.totalResource, prunedTotal), "total resource should be equal to the input")
+	})
+
+	t.Run("NewNode will not prune if no zero values", func(t *testing.T) {
+		proto := newProto("node-with-zero-gpu", prunedTotal, map[string]string{
+			"ready": "true",
+		})
+		node := NewNode(proto)
+		assert.Assert(t, resources.DeepEquals(node.totalResource, prunedTotal), "total resource should be equal to the input")
+	})
+
+	t.Run("GetCapacity prunes zero values", func(t *testing.T) {
+		proto := newProto("node-with-zero-gpu", total, map[string]string{
+			"ready": "true",
+		})
+		node := NewNode(proto)
+		assert.Assert(t, resources.DeepEquals(node.GetCapacity(), prunedTotal), "total resource should be equal to the input")
+	})
+
+	t.Run("SetCapacity prunes zero values", func(t *testing.T) {
+		setTotal := resources.NewResourceFromMap(map[string]resources.Quantity{"cpu": 1, "memory": 10, "gpu": 0})
+		setPrunedTotal := resources.NewResourceFromMap(map[string]resources.Quantity{"cpu": 1, "memory": 10})
+		proto := newProto("node-with-zero-gpu", total, map[string]string{
+			"ready": "true",
+		})
+		node := NewNode(proto)
+		node.SetCapacity(setTotal)
+		assert.Assert(t, resources.DeepEquals(node.GetCapacity(), setPrunedTotal), "total resource should be equal to the input")
+	})
+
+	t.Run("SetOccupiedResource prunes zero values", func(t *testing.T) {
+		proto := newProto("node-with-zero-gpu", total, map[string]string{
+			"ready": "true",
+		})
+		node := NewNode(proto)
+
+		// Force the total resource to be the same as the input
+		node.totalResource = total
+		node.SendNodeAddedEvent()
+		assert.Assert(t, resources.DeepEquals(node.GetCapacity(), prunedTotal), "total resource should be equal to the input")
+	})
+
+	t.Run("prunes zero in total and available", func(t *testing.T) {
+		sn := &Node{
+			totalResource: total,
+		}
+		sn.refreshAvailableResource()
+		assert.Assert(t, resources.DeepEquals(sn.totalResource, prunedTotal), "total resource should be equal to the pruned total")
+		assert.Assert(t, resources.DeepEquals(sn.GetAvailableResource(), prunedTotal), "available resource should be equal to the input")
+	})
+
+	t.Run("prunes zero entries from totalResource (no gpu in result)", func(t *testing.T) {
+		sn := &Node{
+			totalResource:     total,
+			availableResource: resources.NewResourceFromMap(map[string]resources.Quantity{"cpu": 1, "memory": 2}),
+		}
+		expectedUsageShares := map[string]float64{"cpu": 0.9, "memory": 0.8}
+		usageShares := sn.GetResourceUsageShares()
+		assert.Assert(t, cmp.Equal(usageShares, expectedUsageShares), "resource usage shares should be equal to the expected")
+		assert.Assert(t, resources.DeepEquals(sn.totalResource, prunedTotal), "total resource should be equal to the pruned total")
+	})
+
+	t.Run("prunes totalResource and formats fields", func(t *testing.T) {
+		sn := &Node{
+			NodeID:            "n-1",
+			Partition:         "default",
+			schedulable:       true,
+			totalResource:     total,
+			allocatedResource: resources.NewResource(),
+			allocations:       map[string]*Allocation{},
+		}
+
+		out := sn.String()
+		assert.Assert(t, !resources.DeepEquals(sn.totalResource, prunedTotal), "total resource should be equal to the pruned total")
+		assert.Assert(t, strings.Contains(out, "Total map[cpu:10 memory:10]"))
+	})
 }

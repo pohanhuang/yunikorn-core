@@ -81,12 +81,12 @@ func NewNode(proto *si.NodeInfo) *Node {
 	sn.nodeEvents = schedEvt.NewNodeEvents(events.GetEventSystem())
 	// initialise available resources
 	var err error
+	sn.totalResource.Prune()
 	sn.availableResource, err = resources.SubErrorNegative(sn.totalResource, sn.occupiedResource)
 	if err != nil {
 		log.Log(log.SchedNode).Error("New node created with no available resources",
 			zap.Error(err))
 	}
-
 	sn.initializeAttribute(proto.Attributes)
 
 	return sn
@@ -96,6 +96,7 @@ func (sn *Node) String() string {
 	if sn == nil {
 		return "node is nil"
 	}
+	sn.totalResource.Prune()
 	return fmt.Sprintf("NodeID %s, Partition %s, Schedulable %t, Total %s, Allocated %s, #allocations %d",
 		sn.NodeID, sn.Partition, sn.schedulable, sn.totalResource, sn.allocatedResource, len(sn.allocations))
 }
@@ -152,6 +153,7 @@ func (sn *Node) GetReservationKeys() []string {
 func (sn *Node) GetCapacity() *resources.Resource {
 	sn.RLock()
 	defer sn.RUnlock()
+	sn.totalResource.Prune()
 	return sn.totalResource.Clone()
 }
 
@@ -172,6 +174,7 @@ func (sn *Node) SetCapacity(newCapacity *resources.Resource) *resources.Resource
 	}
 	delta = resources.Sub(newCapacity, sn.totalResource)
 	sn.totalResource = newCapacity
+	sn.totalResource.Prune()
 	sn.refreshAvailableResource()
 	sn.nodeEvents.SendNodeCapacityChangedEvent(sn.NodeID, sn.totalResource.Clone())
 	return delta
@@ -187,7 +190,6 @@ func (sn *Node) UpdateAllocatedResource(delta *resources.Resource) {
 	sn.Lock()
 	defer sn.Unlock()
 	sn.allocatedResource.AddTo(delta)
-	sn.allocatedResource.Prune()
 	sn.refreshAvailableResource()
 }
 
@@ -207,6 +209,7 @@ func (sn *Node) SetOccupiedResource(occupiedResource *resources.Resource) {
 // refresh node available resource based on the latest total, allocated and occupied resources.
 // this call assumes the caller already acquires the lock.
 func (sn *Node) refreshAvailableResource() {
+	sn.totalResource.Prune()
 	sn.availableResource = sn.totalResource.Clone()
 	sn.availableResource.SubFrom(sn.allocatedResource)
 	sn.availableResource.SubFrom(sn.occupiedResource)
@@ -393,7 +396,6 @@ func (sn *Node) UpdateForeignAllocation(alloc *Allocation) *Allocation {
 		zap.Stringer("deltaResource", delta),
 		zap.String("targetNode", sn.NodeID))
 	sn.occupiedResource.AddTo(delta)
-	sn.occupiedResource.Prune()
 	sn.refreshAvailableResource()
 
 	return existing
@@ -660,6 +662,7 @@ func (sn *Node) GetResourceUsageShares() map[string]float64 {
 		// no resources present, so no usage
 		return res
 	}
+	sn.totalResource.Prune()
 	for k, v := range sn.totalResource.Resources {
 		res[k] = float64(1) - (float64(sn.availableResource.Resources[k]) / float64(v))
 	}
@@ -704,6 +707,7 @@ func (sn *Node) getListeners() []NodeListener {
 func (sn *Node) SendNodeAddedEvent() {
 	sn.RLock()
 	defer sn.RUnlock()
+	sn.totalResource.Prune()
 	sn.nodeEvents.SendNodeAddedEvent(sn.NodeID, sn.totalResource.Clone())
 }
 
